@@ -1,3 +1,34 @@
+//! A `MockSubscriber` to receive and validate `tracing` data.
+//!
+//! # Overview
+//!
+//! [`tracing`] is a framework for instrumenting Rust programs with context-aware,
+//! structured, event-based diagnostic information. To test the `tracing` data
+//! created by a crate, a `MockSubscriber` must be created. The `MockSubscriber`
+//! can have expectations set on it which can then be validated by setting it as
+//! the default subscriber.
+//!
+//! # Usage
+//!
+//! ```
+//! use tracing::subscriber::with_default;
+//! use tracing_mock::{event, field, span, subscriber};
+//! 
+//! let (subscriber, handle) = subscriber::mock()
+//!        // Expect a single event with a specified message
+//!        .event(event::mock().with_fields(field::msg("droids")))
+//!        .done()
+//!        .run_with_handle();
+//! 
+//! // Use `with_default` to apply the `MockSubscriber` for the duration
+//! // of the closure - this is what we are testing.
+//! with_default(subscriber, || {
+//!     // These *are* the droids we are looking for
+//!     tracing::info!("droids");
+//! });
+//! 
+//! handle.assert_finished();
+//! ```
 #![allow(missing_docs)]
 use super::{
     event::MockEvent,
@@ -20,6 +51,7 @@ use tracing::{
     Event, Metadata, Subscriber,
 };
 
+/// FIXME: I want to see if we can make this non-public
 #[derive(Debug, Eq, PartialEq)]
 pub enum Expect {
     Event(MockEvent),
@@ -52,6 +84,12 @@ struct Running<F: Fn(&Metadata<'_>) -> bool> {
     name: String,
 }
 
+/// A subscriber which can validate received tracing data.
+/// 
+/// For a detailed description and examples see the documentation
+/// for the methods and the [`subscriber`] module.
+/// 
+/// [`subscriber`]: mod@crate::subscriber
 pub struct MockSubscriber<F: Fn(&Metadata<'_>) -> bool> {
     expected: VecDeque<Expect>,
     max_level: Option<LevelFilter>,
@@ -59,8 +97,10 @@ pub struct MockSubscriber<F: Fn(&Metadata<'_>) -> bool> {
     name: String,
 }
 
+/// A handle which is used to invoke validation of expectations.
 pub struct MockHandle(Arc<Mutex<VecDeque<Expect>>>, String);
 
+/// Create a new [`MockSubscriber`]
 pub fn mock() -> MockSubscriber<fn(&Metadata<'_>) -> bool> {
     MockSubscriber {
         expected: VecDeque::new(),
@@ -90,6 +130,23 @@ where
     /// interactions between multiple subscribers. In that case, it can be
     /// helpful to give each subscriber a separate name to distinguish where the
     /// debugging output comes from.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .named("subscriber-1")
+    ///     .event(event::mock())
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::info!("a");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
     pub fn named(self, name: impl ToString) -> Self {
         Self {
             name: name.to_string(),
@@ -97,43 +154,249 @@ where
         }
     }
 
+    /// Expects a span matching the [`MockSpan`] to be entered.
+    /// 
+    /// This expectation is generally accompanied by a call to
+    /// [`exit`] as well. If used together with [`done`], this
+    /// is necessary.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{span, subscriber};
+    /// 
+    /// let span = span::mock()
+    ///     .at_level(tracing::Level::INFO)
+    ///     .named("the span we're testing");
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .enter(span.clone())
+    ///     .exit(span)
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     let span = tracing::info_span!("the span we're testing");
+    ///     let _entered = span.enter();
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
+    /// 
+    /// [`done`]: fn@Self::done
+    /// [`exit`]: fn@Self::exit
     pub fn enter(mut self, span: MockSpan) -> Self {
         self.expected.push_back(Expect::Enter(span));
         self
     }
 
+    /// Expects that a span matching `consequence` follows from a span matching `cause`.
+    /// 
+    /// For further details on what this causal relationship means, see
+    /// [`Span::follows_from`].
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{span, subscriber};
+    /// 
+    /// let span_1 = span::mock().named("cause");
+    /// let span_2 = span::mock().named("consequence");
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .new_span(span_1.clone())
+    ///     .new_span(span_2.clone())
+    ///     .follows_from(span_2, span_1)
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     let cause = tracing::info_span!("cause");
+    ///     let consequence = tracing::info_span!("consequence");
+    /// 
+    ///     consequence.follows_from(cause);
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
+    /// 
+    /// [`Span::follows_from`]: fn@tracing::Span::follows_from
     pub fn follows_from(mut self, consequence: MockSpan, cause: MockSpan) -> Self {
         self.expected
             .push_back(Expect::FollowsFrom { consequence, cause });
         self
     }
 
+    /// Expects an event matching the [`MockEvent`] to be traced.
+    /// 
+    /// The `event` can be simple a default mock which will match
+    /// any event (`tracing-mock::event::mock()`) or can include
+    /// additional requirements. See the [`MockEvent`] documentation
+    /// for more details.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .event(event::mock())
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::info!("a");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```    
     pub fn event(mut self, event: MockEvent) -> Self {
         self.expected.push_back(Expect::Event(event));
         self
     }
 
+    /// Expects a span matching the [`MockSpan`] to exit.
+    /// 
+    /// As a span may be entered and exited multiple times,
+    /// this is different from the span being dropped. In
+    /// general [`enter`] and `exit` should be paired.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{span, subscriber};
+    /// 
+    /// let span = span::mock()
+    ///     .at_level(tracing::Level::INFO)
+    ///     .named("the span we're testing");
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .enter(span.clone())
+    ///     .exit(span.clone())
+    ///     .enter(span.clone())
+    ///     .exit(span)
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     let span = tracing::info_span!("the span we're testing");
+    ///     {
+    ///         let _entered = span.enter();
+    ///     }
+    ///     {
+    ///         let _entered = span.enter();
+    ///     }
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
+    /// 
+    /// [`enter`]: fn@Self::enter
     pub fn exit(mut self, span: MockSpan) -> Self {
         self.expected.push_back(Expect::Exit(span));
         self
     }
 
+    /// Expects a span matching the [`MockSpan`] to be cloned.
+    /// 
+    /// The cloned span does need to have been entered.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{span, subscriber};
+    /// 
+    /// let span = span::mock()
+    ///     .at_level(tracing::Level::INFO)
+    ///     .named("the span we're testing");
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .clone_span(span)
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     let span = tracing::info_span!("the span we're testing");
+    ///     _ = span.clone();
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
     pub fn clone_span(mut self, span: MockSpan) -> Self {
         self.expected.push_back(Expect::CloneSpan(span));
         self
     }
 
+    /// Expects a span matching the [`MockSpan`] to be dropped.
+    /// 
+    /// The cloned span does need to have been entered. This
+    /// allows you to test that the span has its destructor run,
+    /// as opposed to having `std::mem::forget` called on it.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{span, subscriber};
+    /// 
+    /// let span = span::mock()
+    ///     .at_level(tracing::Level::INFO)
+    ///     .named("the span we're testing");
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .drop_span(span)
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     let _span = tracing::info_span!("the span we're testing");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
     #[allow(deprecated)]
     pub fn drop_span(mut self, span: MockSpan) -> Self {
         self.expected.push_back(Expect::DropSpan(span));
         self
     }
 
+    /// Expects that no further traces are received.
+    /// 
+    /// Consider this simple test:
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .event(event::mock())
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::info!("a");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
+    /// 
+    /// If, instead the call to `done` were removed, then additional
+    /// events could be generated and the test would not fail.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .event(event::mock())
+    ///     //.done() <-- No call to done
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::info!("a");
+    ///     tracing::info!("a");
+    ///     tracing::info!("a");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
     pub fn done(mut self) -> Self {
         self.expected.push_back(Expect::Nothing);
         self
     }
 
+    /// Expect that `fields` are recorded on a span matching the [`MockSpan`].
+    /// 
+    /// 
     pub fn record<I>(mut self, span: MockSpan, fields: I) -> Self
     where
         I: Into<mock_field::Expect>,
@@ -142,6 +405,33 @@ where
         self
     }
 
+    /// Expects a span matching `new_span` to be created.
+    /// 
+    /// This function accepts `Into<NewSpan>` instead of a [`MockSpan`]
+    /// directly. So it can be used to test span fields and the span
+    /// parent.
+    /// 
+    /// The new span doesn't need to have been entered.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{field, span, subscriber};
+    /// 
+    /// let span = span::mock()
+    ///     .at_level(tracing::Level::INFO)
+    ///     .named("the span we're testing")
+    ///     .with_field(field::mock("testing").with_value(&"yes"));
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .new_span(span)
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     _ = tracing::info_span!("the span we're testing", testing = "yes");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
     pub fn new_span<I>(mut self, new_span: I) -> Self
     where
         I: Into<NewSpan>,
@@ -150,6 +440,29 @@ where
         self
     }
 
+    /// Filter the traces evaluated by the `MockSubscriber`.
+    /// 
+    /// The filter will be applied to all traces received before
+    /// any verification occurs - so its position in the call chain
+    /// is not important.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .with_filter(|meta| meta.level() <= &tracing::Level::WARN)
+    ///     .event(event::mock())
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::info!("a");
+    ///     tracing::warn!("b");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
     pub fn with_filter<G>(self, filter: G) -> MockSubscriber<G>
     where
         G: Fn(&Metadata<'_>) -> bool + 'static,
@@ -162,6 +475,38 @@ where
         }
     }
 
+    /// Sets the max level that will be provided to the `tracing` system.
+    /// 
+    /// This method can be used to test the internals of `tracing`, but it
+    /// is also useful to filter out traces on more verbose levels if you
+    /// only want to verify above a certain level.
+    /// 
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .with_max_level_hint(tracing::Level::INFO)
+    ///     .event(event::mock().at_level(tracing::Level::INFO))
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::debug!("a message we don't care about");
+    ///     tracing::info!("a message we want to verify");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```
+    /// 
+    /// Note that this value determines a global filter, if `with_max_level_hint`
+    /// is called on multiple subscribers, the global filter will be the least
+    /// restrictive of all subscribers.
+    /// 
+    /// To filter the events evaluated by a specific `MockSubscriebr`, use
+    /// [`with_filter`] instead.
+    /// 
+    /// [`with_filter`]: fn@Self::with_filter
     pub fn with_max_level_hint(self, hint: impl Into<LevelFilter>) -> Self {
         Self {
             max_level: Some(hint.into()),
@@ -471,10 +816,34 @@ where
 }
 
 impl MockHandle {
+    /// TODO: I want to see if we can make this non-public.
     pub fn new(expected: Arc<Mutex<VecDeque<Expect>>>, name: String) -> Self {
         Self(expected, name)
     }
 
+    /// Check all of the expectations specified on the associated [`MockSubscriber`].
+    /// 
+    /// Calling `assert_finished` is usually the final part of a test.
+    /// 
+    /// # Panics
+    /// 
+    /// This method will panic if any of the provided expectations are not met.
+    ///
+    /// ```
+    /// use tracing::subscriber::with_default;
+    /// use tracing_mock::{event, subscriber};
+    /// 
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .event(event::mock())
+    ///     .done()
+    ///     .run_with_handle();
+    /// 
+    /// with_default(subscriber, || {
+    ///     tracing::info!("a");
+    /// });
+    /// 
+    /// handle.assert_finished();
+    /// ```   
     pub fn assert_finished(&self) {
         if let Ok(ref expected) = self.0.lock() {
             assert!(
